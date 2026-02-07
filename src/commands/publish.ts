@@ -201,9 +201,14 @@ export function registerPublishCommand(
             }
           }
 
-          // Check if there are actual changes
+          // Stage files first, then check for actual changes
+          await runCommand(
+            `git add projects/${spokeName}/.collab/`,
+            tmpDir
+          );
+
           const diffCheck = await runCommand(
-            "git diff --quiet && git diff --cached --quiet",
+            "git diff --cached --quiet",
             tmpDir
           );
           if (diffCheck.exitCode === 0) {
@@ -211,12 +216,6 @@ export function registerPublishCommand(
             result(true, "Hub is current, no PR needed");
             return;
           }
-
-          // Commit
-          await runCommand(
-            `git add projects/${spokeName}/.collab/`,
-            tmpDir
-          );
           const commitMsg = `spoke: ${spokeName} status update\n\nProjected by hive-spoke ${version}\nPhase: ${(statusData as any)?.phase ?? "unknown"}\n\nOrigin: agent\nAttested-By: ${manifest.maintainer}`;
           await runCommand(
             `git commit -m "${commitMsg}"`,
