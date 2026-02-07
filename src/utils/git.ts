@@ -73,6 +73,15 @@ export interface SigningConfig {
   fingerprint: string | null;
 }
 
+export async function getGitHubHandle(): Promise<string | null> {
+  try {
+    const result = await $`gh api user --jq .login`.quiet().text();
+    return result.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 export async function getSigningConfig(
   cwd?: string
 ): Promise<SigningConfig> {

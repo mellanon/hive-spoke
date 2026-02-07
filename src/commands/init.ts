@@ -3,7 +3,7 @@ import { join } from "path";
 import { existsSync } from "fs";
 import { withErrorHandling } from "../utils/errors";
 import { writeYaml } from "../utils/yaml";
-import { isGitRepo, getGitUserName, getGitUserEmail, getSigningConfig } from "../utils/git";
+import { isGitRepo, getGitUserName, getGitUserEmail, getGitHubHandle, getSigningConfig } from "../utils/git";
 import { success, warning, header } from "../utils/output";
 import { ACCEPTED_LICENSES } from "../schemas/manifest";
 import { version } from "../version";
@@ -51,7 +51,7 @@ export function registerInitCommand(
           );
         }
 
-        // Gather defaults from git config and SSH key
+        // Gather defaults from git config, GitHub CLI, and SSH key
         const repoName =
           opts.project ?? cwd.split("/").pop() ?? "unknown";
         const gitName = (await getGitUserName(cwd)) ?? "operator";
@@ -59,10 +59,19 @@ export function registerInitCommand(
         const displayName = opts.name ?? gitName;
         const signing = await getSigningConfig(cwd);
 
-        // Derive maintainer handle from hub or git
-        const maintainerHandle = gitEmail.split("@")[0] || gitName;
+        // Derive handle: GitHub login > git name > email prefix
+        const ghHandle = await getGitHubHandle();
+        const maintainerHandle = ghHandle ?? gitName ?? gitEmail.split("@")[0] ?? "operator";
 
         header("Initializing spoke contract...");
+
+        if (ghHandle) {
+          success(`Detected GitHub handle: ${ghHandle}`);
+        } else {
+          warning(
+            `Could not detect GitHub handle (gh CLI not installed or not authenticated). Using "${maintainerHandle}" from git config.`
+          );
+        }
 
         // manifest.yaml
         const manifest: Record<string, unknown> = {
@@ -132,7 +141,16 @@ export function registerInitCommand(
               ? { fingerprint: signing.fingerprint }
               : {}),
           },
-          identities: [],
+          identities: ghHandle
+            ? [
+                {
+                  provider: "github",
+                  id: ghHandle,
+                  verified: true,
+                  verified_at: new Date().toISOString(),
+                },
+              ]
+            : [],
           skills: [],
           availability: "open",
           hives: [
