@@ -4,6 +4,7 @@ import { Command } from "commander";
 import { registerInitCommand } from "./commands/init";
 import { registerStatusCommand } from "./commands/status";
 import { registerValidateCommand } from "./commands/validate";
+import { registerPublishCommand } from "./commands/publish";
 import { version } from "./version";
 
 const program = new Command()
@@ -20,5 +21,6 @@ const getJsonMode = () => program.opts().json ?? false;
 registerInitCommand(program, getJsonMode);
 registerStatusCommand(program, getJsonMode);
 registerValidateCommand(program, getJsonMode);
+registerPublishCommand(program, getJsonMode);
 
 program.parse();
