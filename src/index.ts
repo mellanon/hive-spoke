@@ -5,6 +5,8 @@ import { registerInitCommand } from "./commands/init";
 import { registerStatusCommand } from "./commands/status";
 import { registerValidateCommand } from "./commands/validate";
 import { registerPublishCommand } from "./commands/publish";
+import { registerPullCommand } from "./commands/pull";
+import { registerVerifyCommand } from "./commands/verify";
 import { version } from "./version";
 
 const program = new Command()
@@ -22,5 +24,9 @@ registerInitCommand(program, getJsonMode);
 registerStatusCommand(program, getJsonMode);
 registerValidateCommand(program, getJsonMode);
 registerPublishCommand(program, getJsonMode);
+
+// Register hub-level commands (run from hub repo context)
+registerPullCommand(program, getJsonMode);
+registerVerifyCommand(program, getJsonMode);
 
 program.parse();
