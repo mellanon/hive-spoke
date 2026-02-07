@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import { join } from "path";
 import { readdirSync, existsSync, readFileSync } from "fs";
+import { $ } from "bun";
 import { withErrorHandling } from "../utils/errors";
 import { loadYaml } from "../utils/yaml";
 import { ManifestSchema, type Manifest } from "../schemas/manifest";
@@ -8,6 +9,7 @@ import { formatJson, success, warning, fail, header, result } from "../utils/out
 
 interface VerifyResult {
   project: string;
+  repo: string;
   handle: string;
   fingerprint: string | null;
   inAllowedSigners: boolean;
@@ -15,9 +17,35 @@ interface VerifyResult {
   issues: string[];
 }
 
+interface ProjectYaml {
+  name: string;
+  source?: {
+    repo: string;
+    branch?: string;
+  };
+}
+
 interface VerifyOptions {
   allowedSigners?: string;
   json?: boolean;
+}
+
+async function fetchFileFromRepo(
+  repo: string,
+  path: string,
+  branch: string = "main"
+): Promise<string | null> {
+  try {
+    const result =
+      await $`gh api repos/${repo}/contents/${path}?ref=${branch} --jq .content`
+        .quiet()
+        .text();
+    const base64 = result.trim();
+    if (!base64) return null;
+    return Buffer.from(base64, "base64").toString("utf-8");
+  } catch {
+    return null;
+  }
 }
 
 function parseAllowedSigners(
@@ -36,11 +64,9 @@ function parseAllowedSigners(
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
 
-    // Format: <email> <key-type> <public-key>
     const parts = trimmed.split(/\s+/);
     if (parts.length >= 3) {
       const [email, keyType, publicKey] = parts;
-      // Extract key without the email comment at end
       const fullKey = `${keyType} ${publicKey}`;
       signers.set(email, { email, keyType, publicKey: fullKey });
     }
@@ -68,7 +94,10 @@ export function registerVerifyCommand(
         const json = getJsonMode();
         const cwd = process.cwd();
         const projectsDir = join(cwd, "projects");
-        const signersPath = join(cwd, opts.allowedSigners ?? ".hive/allowed-signers");
+        const signersPath = join(
+          cwd,
+          opts.allowedSigners ?? ".hive/allowed-signers"
+        );
 
         if (!existsSync(projectsDir)) {
           throw new Error(
@@ -98,22 +127,35 @@ export function registerVerifyCommand(
         const results: VerifyResult[] = [];
 
         for (const project of projects) {
-          const manifestPath = join(
+          const projectYamlPath = join(
             projectsDir,
             project,
-            ".collab",
-            "manifest.yaml"
+            "PROJECT.yaml"
           );
+          if (!existsSync(projectYamlPath)) continue;
 
-          if (!existsSync(manifestPath)) continue;
+          const projectYaml = loadYaml<ProjectYaml>(projectYamlPath);
+          if (!projectYaml.source?.repo) continue;
+
+          const repo = projectYaml.source.repo;
+          const branch = projectYaml.source.branch ?? "main";
+
+          const manifestContent = await fetchFileFromRepo(
+            repo,
+            ".collab/manifest.yaml",
+            branch
+          );
+          if (!manifestContent) continue;
 
           let manifest: Manifest;
           try {
-            const raw = loadYaml(manifestPath);
+            const { load } = await import("js-yaml");
+            const raw = load(manifestContent);
             manifest = ManifestSchema.parse(raw);
           } catch {
             results.push({
               project,
+              repo,
               handle: "unknown",
               fingerprint: null,
               inAllowedSigners: false,
@@ -127,17 +169,10 @@ export function registerVerifyCommand(
           const spokeKey = manifest.identity.publicKey;
           const spokeFingerprint = manifest.identity.fingerprint ?? null;
 
-          // Check if any allowed-signer entry has a matching key
           let inAllowedSigners = false;
           let keyMatch = false;
 
           for (const [_email, signer] of allowedSigners) {
-            if (spokeKey.startsWith(signer.publicKey)) {
-              inAllowedSigners = true;
-              keyMatch = true;
-              break;
-            }
-            // Also check if just the key data portion matches
             const spokeKeyParts = spokeKey.split(/\s+/);
             const signerKeyParts = signer.publicKey.split(/\s+/);
             if (
@@ -154,16 +189,19 @@ export function registerVerifyCommand(
 
           if (!inAllowedSigners) {
             issues.push(
-              "Public key NOT in allowed-signers — operator is not registered on hub"
+              "Public key NOT in allowed-signers — operator not registered on hub"
             );
           }
 
           if (!spokeFingerprint) {
-            issues.push("No fingerprint in manifest — cannot verify key binding");
+            issues.push(
+              "No fingerprint in manifest — cannot verify key binding"
+            );
           }
 
           const verifyResult: VerifyResult = {
             project,
+            repo,
             handle: manifest.identity.handle,
             fingerprint: spokeFingerprint,
             inAllowedSigners,
@@ -176,7 +214,7 @@ export function registerVerifyCommand(
           if (!json) {
             const icon = issues.length === 0 ? "\u2713" : "\u2717";
             console.log(
-              `  ${icon} ${project} | @${manifest.identity.handle} | ${spokeFingerprint ?? "no fingerprint"}`
+              `  ${icon} ${project} | @${manifest.identity.handle} | ${repo} | ${spokeFingerprint ?? "no fingerprint"}`
             );
             if (inAllowedSigners) {
               success("  Key found in allowed-signers");
@@ -190,7 +228,9 @@ export function registerVerifyCommand(
         }
 
         if (json) {
-          const verified = results.filter((r) => r.issues.length === 0).length;
+          const verified = results.filter(
+            (r) => r.issues.length === 0
+          ).length;
           console.log(
             formatJson({
               total: results.length,
@@ -202,7 +242,9 @@ export function registerVerifyCommand(
           return;
         }
 
-        const verified = results.filter((r) => r.issues.length === 0).length;
+        const verified = results.filter(
+          (r) => r.issues.length === 0
+        ).length;
         const unverified = results.length - verified;
 
         console.log(

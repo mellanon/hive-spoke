@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import { join } from "path";
 import { readdirSync, existsSync } from "fs";
+import { $ } from "bun";
 import { withErrorHandling } from "../utils/errors";
 import { loadYaml } from "../utils/yaml";
 import { ManifestSchema, type Manifest } from "../schemas/manifest";
@@ -9,6 +10,7 @@ import { formatJson, success, warning, fail, header, result } from "../utils/out
 
 interface SpokeEntry {
   project: string;
+  repo: string;
   maintainer: string;
   phase: string;
   tests: { passing: number; failing: number };
@@ -26,6 +28,16 @@ interface SpokeEntry {
   stale: boolean;
 }
 
+interface ProjectYaml {
+  name: string;
+  maintainer: string;
+  status: string;
+  source?: {
+    repo: string;
+    branch?: string;
+  };
+}
+
 interface PullOptions {
   json?: boolean;
 }
@@ -37,13 +49,33 @@ function isStale(generatedAt: string, thresholdDays: number = 7): boolean {
   return diffMs > thresholdDays * 24 * 60 * 60 * 1000;
 }
 
+async function fetchFileFromRepo(
+  repo: string,
+  path: string,
+  branch: string = "main"
+): Promise<string | null> {
+  try {
+    const result =
+      await $`gh api repos/${repo}/contents/${path}?ref=${branch} --jq .content`
+        .quiet()
+        .text();
+    const base64 = result.trim();
+    if (!base64) return null;
+    return Buffer.from(base64, "base64").toString("utf-8");
+  } catch {
+    return null;
+  }
+}
+
 export function registerPullCommand(
   parent: Command,
   getJsonMode: () => boolean
 ): void {
   parent
     .command("pull")
-    .description("Aggregate spoke statuses from hub projects/ directory")
+    .description(
+      "Fetch spoke statuses from spoke repos (reads .collab/ via GitHub API)"
+    )
     .action(
       withErrorHandling(async (_opts: PullOptions) => {
         const json = getJsonMode();
@@ -56,7 +88,7 @@ export function registerPullCommand(
           );
         }
 
-        header("Aggregating spoke statuses...\n");
+        header("Fetching spoke statuses from repos...\n");
 
         const projects = readdirSync(projectsDir, { withFileTypes: true })
           .filter((d) => d.isDirectory())
@@ -64,40 +96,70 @@ export function registerPullCommand(
           .sort();
 
         const spokes: SpokeEntry[] = [];
-        let withCollab = 0;
-        let withoutCollab = 0;
+        let fetched = 0;
+        let noRepo = 0;
+        let noCollab = 0;
 
         for (const project of projects) {
-          const collabDir = join(projectsDir, project, ".collab");
-          const manifestPath = join(collabDir, "manifest.yaml");
-          const statusPath = join(collabDir, "status.yaml");
+          const projectYamlPath = join(
+            projectsDir,
+            project,
+            "PROJECT.yaml"
+          );
 
-          if (!existsSync(collabDir) || !existsSync(manifestPath)) {
-            withoutCollab++;
-            if (!json) {
-              console.log(`  - ${project} (no .collab/)`);
-            }
+          if (!existsSync(projectYamlPath)) {
+            if (!json) console.log(`  - ${project} (no PROJECT.yaml)`);
+            noRepo++;
             continue;
           }
 
-          withCollab++;
+          const projectYaml = loadYaml<ProjectYaml>(projectYamlPath);
+
+          if (!projectYaml.source?.repo) {
+            if (!json) console.log(`  - ${project} (no source repo)`);
+            noRepo++;
+            continue;
+          }
+
+          const repo = projectYaml.source.repo;
+          const branch = projectYaml.source.branch ?? "main";
+
+          // Fetch manifest.yaml from spoke repo
+          const manifestContent = await fetchFileFromRepo(
+            repo,
+            ".collab/manifest.yaml",
+            branch
+          );
+
+          if (!manifestContent) {
+            if (!json) console.log(`  - ${project} (no .collab/ in ${repo})`);
+            noCollab++;
+            continue;
+          }
+
+          // Fetch status.yaml from spoke repo
+          const statusContent = await fetchFileFromRepo(
+            repo,
+            ".collab/status.yaml",
+            branch
+          );
 
           try {
-            const rawManifest = loadYaml(manifestPath);
+            const { load } = await import("js-yaml");
+            const rawManifest = load(manifestContent);
             const manifest = ManifestSchema.parse(rawManifest);
 
             let status: SpokeStatus | null = null;
-            if (existsSync(statusPath)) {
-              const rawStatus = loadYaml(statusPath);
+            if (statusContent) {
+              const rawStatus = load(statusContent);
               status = StatusSchema.parse(rawStatus);
             }
 
-            const stale = status
-              ? isStale(status.generatedAt)
-              : true;
+            const stale = status ? isStale(status.generatedAt) : true;
 
             const entry: SpokeEntry = {
               project: manifest.project,
+              repo,
               maintainer: manifest.maintainer,
               phase: status?.phase ?? "unknown",
               tests: status?.tests ?? { passing: 0, failing: 0 },
@@ -119,13 +181,13 @@ export function registerPullCommand(
             };
 
             spokes.push(entry);
+            fetched++;
 
             if (!json) {
               const staleTag = stale ? " [STALE]" : "";
-              const testStr =
-                status
-                  ? `${status.tests.passing}P/${status.tests.failing}F`
-                  : "—";
+              const testStr = status
+                ? `${status.tests.passing}P/${status.tests.failing}F`
+                : "—";
               const dirtyTag = entry.dirty ? " [dirty]" : "";
               const behindTag =
                 entry.behindRemote > 0
@@ -133,23 +195,25 @@ export function registerPullCommand(
                   : "";
 
               console.log(
-                `  ${manifest.project} | ${entry.phase} | ${testStr} | @${manifest.maintainer}${dirtyTag}${behindTag}${staleTag}`
+                `  ${manifest.project} | ${entry.phase} | ${testStr} | @${manifest.maintainer} | ${repo}${dirtyTag}${behindTag}${staleTag}`
               );
             }
           } catch (err) {
             if (!json) {
               fail(
-                `${project}: invalid .collab/ data — ${err instanceof Error ? err.message : String(err)}`
+                `${project}: invalid .collab/ in ${repo} — ${err instanceof Error ? err.message : String(err)}`
               );
             }
           }
         }
 
         if (json) {
-          console.log(formatJson({ spokes, withCollab, withoutCollab }));
+          console.log(
+            formatJson({ spokes, fetched, noRepo, noCollab })
+          );
         } else {
           console.log(
-            `\n  ${withCollab} spoke(s) reporting, ${withoutCollab} project(s) without .collab/`
+            `\n  ${fetched} spoke(s) fetched, ${noCollab} repo(s) without .collab/, ${noRepo} project(s) without source repo`
           );
 
           const staleCount = spokes.filter((s) => s.stale).length;
@@ -166,7 +230,7 @@ export function registerPullCommand(
             warning(`${failingCount} spoke(s) have failing tests`);
           }
 
-          result(true, "Hub status aggregation complete");
+          result(true, "Spoke status fetch complete");
         }
       }, getJsonMode)
     );
